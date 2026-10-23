@@ -46,10 +46,23 @@
 </head>
 <body>
   <div id="status">Loading Celestial Sim (WebAssembly + WebGPU)...</div>
-  <canvas id="celestial-canvas"></canvas>
+  <canvas id="celestial-canvas" tabindex="0"></canvas>
   <script>
     (function () {
       const status = document.getElementById("status");
+      const canvas = document.getElementById("celestial-canvas");
+      if (canvas) {
+        canvas.focus();
+        window.addEventListener("pointerdown", function () {
+          canvas.focus();
+        });
+        window.addEventListener("keydown", function (e) {
+          if (document.activeElement !== canvas) {
+            canvas.focus();
+            canvas.dispatchEvent(new KeyboardEvent("keydown", e));
+          }
+        });
+      }
       if (!navigator.gpu) {
         status.innerHTML =
           "<strong>WebGPU is not enabled in this browser.</strong><br/>" +

@@ -169,13 +169,21 @@ impl Runner {
                     }
                 }
             }
-            let sim = stepper.sim.get_or_insert_with(|| init_simulation(&self.settings));
-            stepper.step += 1;
-            let a1 = stepper.a_start * (stepper.a_end / stepper.a_start).powf(stepper.step as Real / stepper.steps as Real);
-            sim.step_to(a1);
             let want_grid = self.control.want_grid.load(Ordering::Relaxed);
-            let _ = stepper.tx.try_send(snapshot(sim, want_grid));
-            stepper.last_step = Some(Instant::now());
+            let Some(sim) = stepper.sim.as_mut() else {
+                let sim = init_simulation(&self.settings);
+                let _ = stepper.tx.try_send(snapshot(&sim, want_grid));
+                stepper.sim = Some(sim);
+                stepper.last_step = Some(Instant::now());
+                return;
+            };
+            let target_step = stepper.step + 1;
+            let a1 = stepper.a_start * (stepper.a_end / stepper.a_start).powf(target_step as Real / stepper.steps as Real);
+            if sim.step_to_incremental(a1, Duration::from_millis(8)) {
+                stepper.step = target_step;
+                let _ = stepper.tx.try_send(snapshot(sim, want_grid));
+                stepper.last_step = Some(Instant::now());
+            }
         }
     }
 
@@ -210,6 +218,9 @@ fn init_simulation(settings: &RunSettings) -> Simulation {
     let split = settings
         .treepm
         .then(|| ForceSplit::with(BOX, mesh_n, n, settings.softening_scale, settings.theta));
+    #[cfg(target_arch = "wasm32")]
+    return Simulation::new_wasm(cosmo, BOX, mesh_n, init.positions, init.momenta, a_start, split);
+    #[cfg(not(target_arch = "wasm32"))]
     Simulation::new(cosmo, BOX, mesh_n, init.positions, init.momenta, a_start, split)
 }
 

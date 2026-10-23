@@ -37,7 +37,7 @@ jobs:
 
       - name: Build WebAssembly bundle with Trunk
         env:
-          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js" -C target-feature=+simd128'
         run: trunk build --release --public-url ./
 
       - name: Upload GitHub Pages artifact

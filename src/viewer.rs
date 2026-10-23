@@ -1105,7 +1105,20 @@ impl App {
 
 // Draws the settings panel. Returns true when the user asks to apply the run settings.
 // `exposure_now` is the exposure in use this frame, shown in the Render tab.
-fn settings_panel(ctx: &egui::Context, panel: &mut PanelState, appearance: &mut Appearance, exposure_now: f32) -> bool {
+fn settings_panel(ctx: &egui::Context, panel: &mut PanelState, appearance: &mut Appearance, exposure_now: f32, redshift: f32) -> bool {
+    egui::Area::new(egui::Id::new("hud_bar"))
+        .fixed_pos(egui::pos2(10.0, 10.0))
+        .show(ctx, |ui| {
+            egui::Frame::window(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(panel.open, "Settings (S)").clicked() {
+                        panel.open = !panel.open;
+                    }
+                    ui.separator();
+                    ui.label(format!("z = {redshift:.2}"));
+                });
+            });
+        });
     let mut apply = false;
     egui::Window::new("Settings")
         .open(&mut panel.open)
@@ -1395,7 +1408,7 @@ impl ApplicationHandler<Gpu> for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if self.gpu.is_some() {
-            self.runner.poll();
+            // runner.poll() runs after RedrawRequested so input events never block on physics.
         }
         // Take the newest frame and drop any older ones the simulation queued up.
         let mut latest = None;
@@ -1499,7 +1512,7 @@ impl ApplicationHandler<Gpu> for App {
                     let panel = &mut self.panel;
                     let appearance = &mut self.appearance;
                     let full = ctx.run_ui(raw, |ui| {
-                        apply = settings_panel(ui.ctx(), panel, appearance, exposure_now);
+                        apply = settings_panel(ui.ctx(), panel, appearance, exposure_now, self.redshift);
                     });
                     gpu.egui_state.handle_platform_output(&gpu.window, full.platform_output);
                     let mut ui = UiOutput {
@@ -1512,6 +1525,9 @@ impl ApplicationHandler<Gpu> for App {
                 }
                 if apply {
                     self.restart();
+                }
+                if !self.left_down && !self.right_down {
+                    self.runner.poll();
                 }
                 self.autosave();
             }

@@ -20,6 +20,17 @@ const STEP_INTEGRAL_STEPS: usize = 64;
 // Bisection iterations to find the time-midpoint a_m.
 const MIDPOINT_ITERATIONS: usize = 60;
 
+#[cfg(target_arch = "wasm32")]
+struct PendingStep {
+    a1: Real,
+    k2: Real,
+    acc: Vec<[Real; 3]>,
+    delta: Mesh,
+    tree: tree::BuiltTree,
+    next_i: usize,
+    stack: Vec<u32>,
+}
+
 pub struct Simulation {
     cosmo: Cosmology,
     box_size: Real,
@@ -35,6 +46,8 @@ pub struct Simulation {
     // Density contrast δ on the mesh at the current positions, from the last force calculation.
     // Kept so the viewer's density colouring and gas don't need a second deposit.
     delta: Mesh,
+    #[cfg(target_arch = "wasm32")]
+    pending: Option<PendingStep>,
 }
 
 impl Simulation {
@@ -58,8 +71,45 @@ impl Simulation {
             accel: Vec::new(),
             split,
             delta: Mesh::new(mesh_n, box_size),
+            #[cfg(target_arch = "wasm32")]
+            pending: None,
         };
         (sim.accel, sim.delta) = sim.accelerations(sim.a);
+        sim
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn new_wasm(
+        cosmo: Cosmology,
+        box_size: Real,
+        mesh_n: usize,
+        positions: Vec<[Real; 3]>,
+        momenta: Vec<[Real; 3]>,
+        a: Real,
+        split: Option<ForceSplit>,
+    ) -> Self {
+        let mut sim = Self {
+            cosmo,
+            box_size,
+            mesh_n,
+            solver: PoissonSolver::new(mesh_n, box_size),
+            positions,
+            momenta,
+            a,
+            accel: Vec::new(),
+            split,
+            delta: Mesh::new(mesh_n, box_size),
+            pending: None,
+        };
+        let delta = sim.density_contrast();
+        let r_split = sim.split.map_or(0.0, |s| s.r_split);
+        let [gx, gy, gz] = sim.solver.acceleration(&delta, &sim.cosmo, a, r_split);
+        sim.accel = sim
+            .positions
+            .iter()
+            .map(|&x| [gx.interpolate(x), gy.interpolate(x), gz.interpolate(x)])
+            .collect();
+        sim.delta = delta;
         sim
     }
 
@@ -133,6 +183,80 @@ impl Simulation {
         let k2 = self.kick_factor(am, a1);
         kick(&mut self.momenta, &self.accel, k2);
         self.a = a1;
+    }
+
+    // Advances a KDK step in time-sliced chunks on wasm32 so the browser UI stays at 60 FPS.
+    // Returns true when the step to `a1` has completed.
+    #[cfg(target_arch = "wasm32")]
+    pub fn step_to_incremental(&mut self, a1: Real, budget: web_time::Duration) -> bool {
+        let started = web_time::Instant::now();
+        if self.pending.is_none() {
+            let a0 = self.a;
+            let am = self.midpoint(a0, a1);
+            let k1 = self.kick_factor(a0, am);
+            kick(&mut self.momenta, &self.accel, k1);
+            let d = self.drift_factor(a0, a1);
+            drift(&mut self.positions, &self.momenta, d, self.box_size);
+            let k2 = self.kick_factor(am, a1);
+            let delta = self.density_contrast();
+            let r_split = self.split.map_or(0.0, |s| s.r_split);
+            let [gx, gy, gz] = self.solver.acceleration(&delta, &self.cosmo, a1, r_split);
+            let acc: Vec<[Real; 3]> = self
+                .positions
+                .iter()
+                .map(|&x| [gx.interpolate(x), gy.interpolate(x), gz.interpolate(x)])
+                .collect();
+            if self.split.is_none() {
+                self.accel = acc;
+                self.delta = delta;
+                kick(&mut self.momenta, &self.accel, k2);
+                self.a = a1;
+                return true;
+            }
+            let tree = tree::Tree::build(&self.positions, self.box_size).into_built();
+            self.pending = Some(PendingStep {
+                a1,
+                k2,
+                acc,
+                delta,
+                tree,
+                next_i: 0,
+                stack: Vec::with_capacity(64),
+            });
+            if started.elapsed() >= budget {
+                return false;
+            }
+        }
+
+        if let (Some(p), Some(split)) = (self.pending.as_mut(), self.split.as_ref()) {
+            let n = self.positions.len();
+            let k = 1.5 * self.cosmo.omega_m * self.box_size.powi(3) / (4.0 * std::f32::consts::PI * p.a1 * n as Real);
+            while p.next_i < n {
+                let end = (p.next_i + 256).min(n);
+                for i in p.next_i..end {
+                    let s = p.tree.accel_on(&self.positions, i, split, k, &mut p.stack);
+                    for c in 0..3 {
+                        p.acc[i][c] += s[c];
+                    }
+                }
+                p.next_i = end;
+                if p.next_i < n && started.elapsed() >= budget {
+                    return false;
+                }
+            }
+        }
+
+        if let Some(p) = self.pending.take() {
+            self.accel = p.acc;
+            self.delta = p.delta;
+            kick(&mut self.momenta, &self.accel, p.k2);
+            self.a = p.a1;
+        }
+        true
+    }
+
+    #[allow(dead_code)]
+    fn _unused_end(&self) {
     }
 
     // ∫ da / (a E): the time-to-momentum factor for a kick.

@@ -79,6 +79,77 @@ struct Node {
     end: u32,
 }
 
+pub struct BuiltTree {
+    box_size: Real,
+    inv_box_size: Real,
+    order: Vec<u32>,
+    nodes: Vec<Node>,
+}
+
+impl BuiltTree {
+    #[inline]
+    fn min_image(&self, a: [Real; 3], b: [Real; 3]) -> [Real; 3] {
+        let l = self.box_size;
+        let inv_l = self.inv_box_size;
+        let mut d = [0.0; 3];
+        for k in 0..3 {
+            let x = a[k] - b[k];
+            d[k] = x - l * (x * inv_l).round();
+        }
+        d
+    }
+
+    // Short-range acceleration on particle `i`, walking the tree with an explicit stack.
+    pub fn accel_on(&self, positions: &[[Real; 3]], i: usize, split: &ForceSplit, k: Real, stack: &mut Vec<u32>) -> [Real; 3] {
+        let xi = positions[i];
+        let cut2 = split.r_cut * split.r_cut;
+        let theta2 = split.theta * split.theta;
+        let mut acc = [0.0; 3];
+        stack.clear();
+        stack.push(0);
+        while let Some(n) = stack.pop() {
+            let node = self.nodes[n as usize];
+
+            // Skip a cube that lies entirely beyond the cutoff.
+            let to_centre = self.min_image(node.center, xi);
+            let max_r = split.r_cut + SQRT_3 * node.half;
+            if norm2(to_centre) > max_r * max_r {
+                continue;
+            }
+
+            if node.children[0] == NO_CHILD {
+                // Leaf: sum over its particles directly.
+                for &j in &self.order[node.start as usize..node.end as usize] {
+                    let j = j as usize;
+                    if j == i {
+                        continue;
+                    }
+                    let d = self.min_image(xi, positions[j]);
+                    if norm2(d) > cut2 {
+                        continue;
+                    }
+                    add_to(&mut acc, pair(d, 1.0, k, split));
+                }
+            } else {
+                // Internal node: use its centre of mass if it is far enough away, otherwise descend.
+                let to_com = self.min_image(node.com, xi);
+                let r2 = norm2(to_com);
+                if 4.0 * node.half * node.half < theta2 * r2 {
+                    let d = [-to_com[0], -to_com[1], -to_com[2]];
+                    add_to(&mut acc, pair(d, node.count as Real, k, split));
+                } else {
+                    for &c in &node.children {
+                        if c != NO_CHILD {
+                            stack.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        acc
+    }
+}
+
 pub struct Tree<'a> {
     positions: &'a [[Real; 3]],
     box_size: Real,
@@ -88,6 +159,15 @@ pub struct Tree<'a> {
 }
 
 impl<'a> Tree<'a> {
+    pub fn into_built(self) -> BuiltTree {
+        BuiltTree {
+            box_size: self.box_size,
+            inv_box_size: 1.0 / self.box_size,
+            order: self.order,
+            nodes: self.nodes,
+        }
+    }
+
     pub fn build(positions: &'a [[Real; 3]], box_size: Real) -> Self {
         let n = positions.len();
         let mut tree = Self {
@@ -192,7 +272,8 @@ impl<'a> Tree<'a> {
 
             // Skip a cube that lies entirely beyond the cutoff.
             let to_centre = self.min_image(node.center, xi);
-            if norm2(to_centre).sqrt() - SQRT_3 * node.half > split.r_cut {
+            let max_r = split.r_cut + SQRT_3 * node.half;
+            if norm2(to_centre) > max_r * max_r {
                 continue;
             }
 
