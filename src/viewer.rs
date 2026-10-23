@@ -268,7 +268,16 @@ struct Gpu {
 
 impl Gpu {
     async fn new_async(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
+        let mut size = window.inner_size();
+        #[cfg(target_arch = "wasm32")]
+        if size.width <= 1 || size.height <= 1 {
+            if let Some(web_win) = web_sys::window() {
+                let scale = window.scale_factor();
+                let w = web_win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(900.0);
+                let h = web_win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(900.0);
+                size = winit::dpi::PhysicalSize::new((w * scale) as u32, (h * scale) as u32);
+            }
+        }
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(window.clone())
@@ -650,8 +659,9 @@ struct App {
     // What was last written to disk. Changes are saved when this differs from the current state.
     last_saved: Saved,
     save_path: PathBuf,
+    pending_size: Option<[u32; 2]>,
     #[cfg(target_arch = "wasm32")]
-    gpu_rx: Option<std::sync::mpsc::Receiver<Gpu>>,
+    proxy: winit::event_loop::EventLoopProxy<Gpu>,
     #[cfg(target_arch = "wasm32")]
     initializing: bool,
 }
@@ -1103,7 +1113,28 @@ fn render_tab(ui: &mut egui::Ui, appearance: &mut Appearance, exposure_now: f32)
     ui.label("These settings only change rendering. On integrated graphics, heavy rendering (gas, bloom) shares the power budget with the simulation and can slow it.");
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<Gpu> for App {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, mut gpu: Gpu) {
+        let win_size = gpu.window.inner_size();
+        let (w, h) = match self.pending_size.take() {
+            Some([pw, ph]) if pw > 1 && ph > 1 => (pw, ph),
+            _ if win_size.width > 1 && win_size.height > 1 => (win_size.width, win_size.height),
+            _ => (gpu.config.width.max(1), gpu.config.height.max(1)),
+        };
+        gpu.resize(w, h);
+        self.slice = Some(Camera::fit_box(self.box_size, [w as f32, h as f32]));
+        self.orbit = Some(Orbit::fit_box(self.box_size));
+        #[cfg(target_arch = "wasm32")]
+        if let Some(doc) = web_sys::window().and_then(|win| win.document()) {
+            if let Some(el) = doc.get_element_by_id("status") {
+                let _ = el.set_attribute("style", "display: none;");
+            }
+        }
+        gpu.window.request_redraw();
+        self.gpu = Some(gpu);
+        self.runner.poll();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gpu.is_some() {
             return;
@@ -1129,12 +1160,10 @@ impl ApplicationHandler for App {
                 .with_canvas(canvas)
                 .with_append(true);
             let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.gpu_rx = Some(rx);
+            let proxy = self.proxy.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let gpu = Gpu::new_async(window.clone()).await;
-                let _ = tx.send(gpu);
-                window.request_redraw();
+                let _ = proxy.send_event(gpu);
             });
             return;
         }
@@ -1144,7 +1173,16 @@ impl ApplicationHandler for App {
             .with_title("Celestial Sim   (S: settings)")
             .with_inner_size(LogicalSize::new(900.0, 900.0));
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
-        let size = window.inner_size();
+        let mut size = window.inner_size();
+        #[cfg(target_arch = "wasm32")]
+        if size.width <= 1 || size.height <= 1 {
+            if let Some(web_win) = web_sys::window() {
+                let scale = window.scale_factor();
+                let w = web_win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(900.0);
+                let h = web_win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(900.0);
+                size = winit::dpi::PhysicalSize::new((w * scale) as u32, (h * scale) as u32);
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let gpu = pollster::block_on(Gpu::new_async(window));
         self.slice = Some(Camera::fit_box(self.box_size, [size.width as f32, size.height as f32]));
@@ -1154,17 +1192,6 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        #[cfg(target_arch = "wasm32")]
-        if self.gpu.is_none() {
-            if let Some(rx) = &self.gpu_rx {
-                if let Ok(gpu) = rx.try_recv() {
-                    let size = gpu.window.inner_size();
-                    self.slice = Some(Camera::fit_box(self.box_size, [size.width.max(1) as f32, size.height.max(1) as f32]));
-                    self.orbit = Some(Orbit::fit_box(self.box_size));
-                    self.gpu = Option::Some(gpu);
-                }
-            }
-        }
         if self.gpu.is_some() {
             self.runner.poll();
         }
@@ -1228,17 +1255,6 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        #[cfg(target_arch = "wasm32")]
-        if self.gpu.is_none() {
-            if let Some(rx) = &self.gpu_rx {
-                if let Ok(gpu) = rx.try_recv() {
-                    let size = gpu.window.inner_size();
-                    self.slice = Some(Camera::fit_box(self.box_size, [size.width.max(1) as f32, size.height.max(1) as f32]));
-                    self.orbit = Some(Orbit::fit_box(self.box_size));
-                    self.gpu = Option::Some(gpu);
-                }
-            }
-        }
         // egui sees every event first. If it consumes one (a click on the panel), the camera ignores it.
         let consumed = match self.gpu.as_mut() {
             Some(gpu) => gpu.egui_state.on_window_event(&gpu.window, &event).consumed,
@@ -1250,6 +1266,8 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(size.width, size.height);
+                } else {
+                    self.pending_size = Some([size.width, size.height]);
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -1393,7 +1411,9 @@ impl ApplicationHandler for App {
 // Blocks the calling (main) thread.
 pub fn run(box_size: f32, save_path: PathBuf) {
     let saved = store::load(&save_path);
-    let event_loop = EventLoop::new().expect("create event loop");
+    let event_loop = EventLoop::<Gpu>::with_user_event().build().expect("create event loop");
+    #[cfg(target_arch = "wasm32")]
+    let proxy = event_loop.create_proxy();
     let runner = Runner::start(saved.run.clone());
     let appearance = saved.appearance.clone();
     let last_saved = Saved {
@@ -1425,8 +1445,9 @@ pub fn run(box_size: f32, save_path: PathBuf) {
         },
         appearance,
         last_saved,
+        pending_size: None,
         #[cfg(target_arch = "wasm32")]
-        gpu_rx: None,
+        proxy,
         #[cfg(target_arch = "wasm32")]
         initializing: false,
         save_path,

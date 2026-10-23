@@ -22,9 +22,49 @@
       height: 100vh;
       outline: none;
     }
+    #status {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      text-align: center;
+      pointer-events: none;
+      z-index: 10;
+      background: rgba(0, 0, 0, 0.75);
+      line-height: 1.5;
+    }
+    #status code {
+      background: #1e1e1e;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #9cdcfe;
+    }
   </style>
 </head>
 <body>
+  <div id="status">Loading Celestial Sim (WebAssembly + WebGPU)...</div>
   <canvas id="celestial-canvas"></canvas>
+  <script>
+    (function () {
+      const status = document.getElementById("status");
+      if (!navigator.gpu) {
+        status.innerHTML =
+          "<strong>WebGPU is not enabled in this browser.</strong><br/>" +
+          "Please open this page in Chrome 113+, Edge 113+, or Safari 18+ with WebGPU enabled.";
+        return;
+      }
+      setTimeout(function () {
+        if (document.querySelector("link[data-trunk]")) {
+          status.innerHTML =
+            "<strong>Uncompiled <code>index.html</code> detected.</strong><br/>" +
+            "GitHub Pages is serving the raw source branch instead of the compiled WebAssembly bundle.<br/>" +
+            "In your GitHub repository, go to <strong>Settings &rarr; Pages &rarr; Build and deployment &rarr; Source</strong> and select <strong>GitHub Actions</strong>.";
+        }
+      }, 2500);
+    })();
+  </script>
 </body>
 </html>
