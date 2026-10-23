@@ -29,6 +29,208 @@ use crate::lens::{self, Lens, LensParams};
 use crate::lens_fft::{self, LensFft, LensFftParams};
 use crate::volume::{GasParams, Volume};
 
+#[cfg(target_arch = "wasm32")]
+mod egui_winit {
+    use web_time::Instant;
+    use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+    use winit::keyboard::{Key, NamedKey};
+    use winit::window::{Theme, Window};
+
+    pub struct EventResponse {
+        pub consumed: bool,
+    }
+
+    pub struct State {
+        egui_ctx: egui::Context,
+        viewport_id: egui::ViewportId,
+        start_time: Instant,
+        egui_input: egui::RawInput,
+        pointer_pos_in_points: Option<egui::Pos2>,
+        modifiers: egui::Modifiers,
+    }
+
+    impl State {
+        pub fn new(
+            egui_ctx: egui::Context,
+            viewport_id: egui::ViewportId,
+            window: &Window,
+            native_pixels_per_point: Option<f32>,
+            _theme: Option<Theme>,
+            max_texture_side: Option<usize>,
+        ) -> Self {
+            let mut egui_input = egui::RawInput {
+                viewport_id,
+                max_texture_side,
+                ..Default::default()
+            };
+            let ppp = native_pixels_per_point.unwrap_or_else(|| window.scale_factor() as f32);
+            egui_input
+                .viewports
+                .entry(viewport_id)
+                .or_default()
+                .native_pixels_per_point = Some(ppp);
+            Self {
+                egui_ctx,
+                viewport_id,
+                start_time: Instant::now(),
+                egui_input,
+                pointer_pos_in_points: None,
+                modifiers: egui::Modifiers::default(),
+            }
+        }
+
+        fn pixels_per_point(&self, window: &Window) -> f32 {
+            self.egui_ctx.zoom_factor() * window.scale_factor() as f32
+        }
+
+        pub fn take_egui_input(&mut self, window: &Window) -> egui::RawInput {
+            self.egui_input.time = Some(self.start_time.elapsed().as_secs_f64());
+            let size = window.inner_size();
+            let ppp = self.pixels_per_point(window);
+            let screen_size_in_points = egui::vec2(size.width as f32 / ppp, size.height as f32 / ppp);
+            self.egui_input.screen_rect = (screen_size_in_points.x > 0.0 && screen_size_in_points.y > 0.0)
+                .then(|| egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size_in_points));
+            self.egui_input.viewport_id = self.viewport_id;
+            self.egui_input
+                .viewports
+                .entry(self.viewport_id)
+                .or_default()
+                .native_pixels_per_point = Some(window.scale_factor() as f32);
+            self.egui_input.take()
+        }
+
+        pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> EventResponse {
+            match event {
+                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                    self.egui_input
+                        .viewports
+                        .entry(self.viewport_id)
+                        .or_default()
+                        .native_pixels_per_point = Some(*scale_factor as f32);
+                    EventResponse { consumed: false }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    let ppp = self.pixels_per_point(window);
+                    let pos = egui::pos2(position.x as f32 / ppp, position.y as f32 / ppp);
+                    self.pointer_pos_in_points = Some(pos);
+                    self.egui_input.events.push(egui::Event::PointerMoved(pos));
+                    EventResponse {
+                        consumed: self.egui_ctx.egui_is_using_pointer(),
+                    }
+                }
+                WindowEvent::CursorLeft { .. } => {
+                    self.pointer_pos_in_points = None;
+                    self.egui_input.events.push(egui::Event::PointerGone);
+                    EventResponse { consumed: false }
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    if let Some(pos) = self.pointer_pos_in_points {
+                        let btn = match button {
+                            MouseButton::Left => Some(egui::PointerButton::Primary),
+                            MouseButton::Right => Some(egui::PointerButton::Secondary),
+                            MouseButton::Middle => Some(egui::PointerButton::Middle),
+                            MouseButton::Back => Some(egui::PointerButton::Extra1),
+                            MouseButton::Forward => Some(egui::PointerButton::Extra2),
+                            MouseButton::Other(_) => None,
+                        };
+                        if let Some(button) = btn {
+                            self.egui_input.events.push(egui::Event::PointerButton {
+                                pos,
+                                button,
+                                pressed: *state == ElementState::Pressed,
+                                modifiers: self.modifiers,
+                            });
+                        }
+                    }
+                    EventResponse {
+                        consumed: self.egui_ctx.egui_wants_pointer_input(),
+                    }
+                }
+                WindowEvent::MouseWheel { delta, phase, .. } => {
+                    let ppp = self.pixels_per_point(window);
+                    let (unit, delta) = match *delta {
+                        MouseScrollDelta::LineDelta(x, y) => (egui::MouseWheelUnit::Line, egui::vec2(x, y)),
+                        MouseScrollDelta::PixelDelta(p) => (
+                            egui::MouseWheelUnit::Point,
+                            egui::vec2(p.x as f32, p.y as f32) / ppp,
+                        ),
+                    };
+                    let phase = match phase {
+                        TouchPhase::Started => egui::TouchPhase::Start,
+                        TouchPhase::Moved => egui::TouchPhase::Move,
+                        TouchPhase::Ended => egui::TouchPhase::End,
+                        TouchPhase::Cancelled => egui::TouchPhase::Cancel,
+                    };
+                    self.egui_input.events.push(egui::Event::MouseWheel {
+                        unit,
+                        delta,
+                        phase,
+                        modifiers: self.modifiers,
+                    });
+                    EventResponse {
+                        consumed: self.egui_ctx.egui_wants_pointer_input(),
+                    }
+                }
+                WindowEvent::ModifiersChanged(state) => {
+                    let s = state.state();
+                    self.modifiers.alt = s.alt_key();
+                    self.modifiers.ctrl = s.control_key();
+                    self.modifiers.shift = s.shift_key();
+                    self.modifiers.command = s.control_key() || s.super_key();
+                    self.egui_input
+                        .events
+                        .push(egui::Event::ModifiersChanged(self.modifiers));
+                    EventResponse { consumed: false }
+                }
+                WindowEvent::KeyboardInput { event, .. } => {
+                    let pressed = event.state == ElementState::Pressed;
+                    let key = match &event.logical_key {
+                        Key::Named(NamedKey::ArrowDown) => Some(egui::Key::ArrowDown),
+                        Key::Named(NamedKey::ArrowLeft) => Some(egui::Key::ArrowLeft),
+                        Key::Named(NamedKey::ArrowRight) => Some(egui::Key::ArrowRight),
+                        Key::Named(NamedKey::ArrowUp) => Some(egui::Key::ArrowUp),
+                        Key::Named(NamedKey::Escape) => Some(egui::Key::Escape),
+                        Key::Named(NamedKey::Tab) => Some(egui::Key::Tab),
+                        Key::Named(NamedKey::Backspace) => Some(egui::Key::Backspace),
+                        Key::Named(NamedKey::Enter) => Some(egui::Key::Enter),
+                        Key::Named(NamedKey::Space) => Some(egui::Key::Space),
+                        Key::Named(NamedKey::Insert) => Some(egui::Key::Insert),
+                        Key::Named(NamedKey::Delete) => Some(egui::Key::Delete),
+                        Key::Named(NamedKey::Home) => Some(egui::Key::Home),
+                        Key::Named(NamedKey::End) => Some(egui::Key::End),
+                        Key::Named(NamedKey::PageUp) => Some(egui::Key::PageUp),
+                        Key::Named(NamedKey::PageDown) => Some(egui::Key::PageDown),
+                        Key::Character(c) => egui::Key::from_name(c.as_str()),
+                        _ => None,
+                    };
+                    if let Some(key) = key {
+                        self.egui_input.events.push(egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: self.modifiers,
+                        });
+                    }
+                    if pressed && !self.modifiers.ctrl && !self.modifiers.command {
+                        if let Some(text) = event.text.as_ref().map(|t| t.as_str()) {
+                            if !text.is_empty() && !text.chars().any(char::is_control) {
+                                self.egui_input.events.push(egui::Event::Text(text.to_string()));
+                            }
+                        }
+                    }
+                    EventResponse {
+                        consumed: self.egui_ctx.egui_wants_keyboard_input(),
+                    }
+                }
+                _ => EventResponse { consumed: false },
+            }
+        }
+
+        pub fn handle_platform_output(&mut self, _window: &Window, _output: egui::PlatformOutput) {}
+    }
+}
+
 // Scroll zoom per line of wheel movement in the 2D slice view.
 const ZOOM_PER_LINE: f32 = 1.1;
 // Fraction of particles, from the slow end, that clamp to the coldest colour.
