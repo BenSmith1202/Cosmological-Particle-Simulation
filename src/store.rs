@@ -30,6 +30,12 @@ impl Saved {
 
 // Loads from `path`. Any problem (missing file, bad JSON) gives the defaults, with a warning if the file existed.
 pub fn load(path: &Path) -> Saved {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        return Saved::default();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<Saved>(&text) {
             Ok(saved) => saved.sanitized(),
@@ -43,8 +49,16 @@ pub fn load(path: &Path) -> Saved {
 }
 
 pub fn save(path: &Path, saved: &Saved) -> std::io::Result<()> {
-    let text = serde_json::to_string_pretty(saved).map_err(std::io::Error::other)?;
-    std::fs::write(path, text)
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (path, saved);
+        return Ok(());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let text = serde_json::to_string_pretty(saved).map_err(std::io::Error::other)?;
+        std::fs::write(path, text)
+    }
 }
 
 #[cfg(test)]

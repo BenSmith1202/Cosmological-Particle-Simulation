@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::{mpsc::TryRecvError, Arc};
-use std::time::Instant;
+use web_time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -267,18 +267,18 @@ struct Gpu {
 }
 
 impl Gpu {
-    fn new(window: Arc<Window>) -> Self {
+    async fn new_async(window: Arc<Window>) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(window.clone())
             .expect("create surface");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface: Some(&surface),
             ..Default::default()
-        }))
+        }).await
         .expect("no compatible GPU adapter");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() }))
+        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() }).await
             .expect("request device");
 
         let config = surface
@@ -650,11 +650,16 @@ struct App {
     // What was last written to disk. Changes are saved when this differs from the current state.
     last_saved: Saved,
     save_path: PathBuf,
+    #[cfg(target_arch = "wasm32")]
+    gpu_rx: Option<std::sync::mpsc::Receiver<Gpu>>,
+    #[cfg(target_arch = "wasm32")]
+    initializing: bool,
 }
 
 impl App {
     fn viewport(&self) -> [f32; 2] {
-        let c = &self.gpu.as_ref().expect("gpu").config;
+        let Some(gpu) = self.gpu.as_ref() else { return [900.0, 900.0]; };
+        let c = &gpu.config;
         [c.width as f32, c.height as f32]
     }
 
@@ -1103,18 +1108,66 @@ impl ApplicationHandler for App {
         if self.gpu.is_some() {
             return;
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.initializing {
+                return;
+            }
+            self.initializing = true;
+            use wasm_bindgen::JsCast;
+            use winit::platform::web::WindowAttributesExtWebSys;
+            let web_window = web_sys::window().expect("browser window");
+            let width = web_window.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(900.0);
+            let height = web_window.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(900.0);
+            let document = web_window.document().expect("document");
+            let canvas = document
+                .get_element_by_id("celestial-canvas")
+                .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok());
+            let attributes = Window::default_attributes()
+                .with_title("Celestial Sim   (S: settings)")
+                .with_inner_size(LogicalSize::new(width, height))
+                .with_canvas(canvas)
+                .with_append(true);
+            let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.gpu_rx = Some(rx);
+            wasm_bindgen_futures::spawn_local(async move {
+                let gpu = Gpu::new_async(window.clone()).await;
+                let _ = tx.send(gpu);
+                window.request_redraw();
+            });
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
         let attributes = Window::default_attributes()
             .with_title("Celestial Sim   (S: settings)")
             .with_inner_size(LogicalSize::new(900.0, 900.0));
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
         let size = window.inner_size();
-        let gpu = Gpu::new(window);
+        #[cfg(not(target_arch = "wasm32"))]
+        let gpu = pollster::block_on(Gpu::new_async(window));
         self.slice = Some(Camera::fit_box(self.box_size, [size.width as f32, size.height as f32]));
         self.orbit = Some(Orbit::fit_box(self.box_size));
         self.gpu = Some(gpu);
+        }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        #[cfg(target_arch = "wasm32")]
+        if self.gpu.is_none() {
+            if let Some(rx) = &self.gpu_rx {
+                if let Ok(gpu) = rx.try_recv() {
+                    let size = gpu.window.inner_size();
+                    self.slice = Some(Camera::fit_box(self.box_size, [size.width.max(1) as f32, size.height.max(1) as f32]));
+                    self.orbit = Some(Orbit::fit_box(self.box_size));
+                    self.gpu = Option::Some(gpu);
+                }
+            }
+        }
+        if self.gpu.is_some() {
+            self.runner.poll();
+        }
         // Take the newest frame and drop any older ones the simulation queued up.
         let mut latest = None;
         loop {
@@ -1175,6 +1228,17 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        #[cfg(target_arch = "wasm32")]
+        if self.gpu.is_none() {
+            if let Some(rx) = &self.gpu_rx {
+                if let Ok(gpu) = rx.try_recv() {
+                    let size = gpu.window.inner_size();
+                    self.slice = Some(Camera::fit_box(self.box_size, [size.width.max(1) as f32, size.height.max(1) as f32]));
+                    self.orbit = Some(Orbit::fit_box(self.box_size));
+                    self.gpu = Option::Some(gpu);
+                }
+            }
+        }
         // egui sees every event first. If it consumes one (a click on the panel), the camera ignores it.
         let consumed = match self.gpu.as_mut() {
             Some(gpu) => gpu.egui_state.on_window_event(&gpu.window, &event).consumed,
@@ -1189,6 +1253,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                if self.gpu.is_none() {
+                    return;
+                }
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_redraw).as_secs_f32();
                 self.last_redraw = now;
@@ -1358,8 +1425,19 @@ pub fn run(box_size: f32, save_path: PathBuf) {
         },
         appearance,
         last_saved,
+        #[cfg(target_arch = "wasm32")]
+        gpu_rx: None,
+        #[cfg(target_arch = "wasm32")]
+        initializing: false,
         save_path,
     };
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::EventLoopExtWebSys;
+        let _ = &mut app;
+        event_loop.spawn_app(app);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     event_loop.run_app(&mut app).expect("event loop");
 }
 

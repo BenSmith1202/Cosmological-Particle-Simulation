@@ -1,4 +1,5 @@
-// Runs the simulation on a worker thread, and restarts it with new settings when the viewer asks.
+// Runs the simulation on a worker thread (desktop) or incrementally per frame (wasm32),
+// and restarts it with new settings when the viewer asks.
 // The viewer owns the window, so it stays on the main thread. Frames cross a one-slot channel.
 
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use crate::cosmology::Cosmology;
 use crate::ics::{zeldovich, PowerSpectrum, N_S, SIGMA8, SIGMA8_RADIUS};
@@ -89,15 +90,29 @@ struct Control {
     want_grid: AtomicBool,
 }
 
+// In-process stepper used on wasm32 where std::thread::spawn is unavailable.
+#[cfg(target_arch = "wasm32")]
+struct WasmStepper {
+    tx: SyncSender<Frame>,
+    sim: Option<Simulation>,
+    a_start: Real,
+    a_end: Real,
+    step: usize,
+    steps: usize,
+    last_step: Option<Instant>,
+}
+
 pub struct Runner {
     pub frames: Receiver<Frame>,
     pub settings: RunSettings,
     control: Arc<Control>,
     handle: Option<JoinHandle<()>>,
+    #[cfg(target_arch = "wasm32")]
+    wasm_stepper: Option<WasmStepper>,
 }
 
 impl Runner {
-    // Starts a run on a worker thread. The settings are sanitized first.
+    // Starts a run on a worker thread (desktop) or prepares the frame stepper (wasm32). The settings are sanitized first.
     pub fn start(settings: RunSettings) -> Self {
         let settings = settings.sanitized();
         // One slot: if the viewer hasn't taken the last frame, the worker drops the new one rather than waiting.
@@ -107,14 +122,60 @@ impl Runner {
             pacing_ms: AtomicU32::new(settings.pacing_ms),
             want_grid: AtomicBool::new(false),
         });
-        let worker_control = Arc::clone(&control);
-        let worker_settings = settings.clone();
-        let handle = std::thread::spawn(move || run_simulation(tx, &worker_settings, &worker_control));
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let handle = {
+            let worker_control = Arc::clone(&control);
+            let worker_settings = settings.clone();
+            Some(std::thread::spawn(move || run_simulation(tx, &worker_settings, &worker_control)))
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        let handle = None;
+
+        #[cfg(target_arch = "wasm32")]
+        let wasm_stepper = Some(WasmStepper {
+            tx,
+            sim: None,
+            a_start: 1.0 / (1.0 + settings.z_start),
+            a_end: 1.0 / (1.0 + settings.z_end),
+            step: 0,
+            steps: settings.steps,
+            last_step: None,
+        });
+
         Self {
             frames: rx,
             settings,
             control,
-            handle: Some(handle),
+            handle,
+            #[cfg(target_arch = "wasm32")]
+            wasm_stepper,
+        }
+    }
+
+    // Advances the simulation by one step on wasm32. No-op on desktop (where the worker thread runs continuously).
+    pub fn poll(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(stepper) = self.wasm_stepper.as_mut() {
+            if stepper.step >= stepper.steps {
+                return;
+            }
+            let pause = self.control.pacing_ms.load(Ordering::Relaxed);
+            if pause > 0 {
+                if let Some(last) = stepper.last_step {
+                    if last.elapsed() < Duration::from_millis(pause as u64) {
+                        return;
+                    }
+                }
+            }
+            let sim = stepper.sim.get_or_insert_with(|| init_simulation(&self.settings));
+            stepper.step += 1;
+            let a1 = stepper.a_start * (stepper.a_end / stepper.a_start).powf(stepper.step as Real / stepper.steps as Real);
+            sim.step_to(a1);
+            let want_grid = self.control.want_grid.load(Ordering::Relaxed);
+            let _ = stepper.tx.try_send(snapshot(sim, want_grid));
+            stepper.last_step = Some(Instant::now());
         }
     }
 
@@ -137,10 +198,9 @@ impl Runner {
     }
 }
 
-fn run_simulation(frames: SyncSender<Frame>, settings: &RunSettings, control: &Control) {
+fn init_simulation(settings: &RunSettings) -> Simulation {
     let cosmo = Cosmology::lcdm_default();
     let a_start = 1.0 / (1.0 + settings.z_start);
-    let a_end = 1.0 / (1.0 + settings.z_end);
     let ps = PowerSpectrum::normalized(&cosmo, N_S, SIGMA8, SIGMA8_RADIUS);
 
     let n = settings.particles_per_side;
@@ -150,7 +210,14 @@ fn run_simulation(frames: SyncSender<Frame>, settings: &RunSettings, control: &C
     let split = settings
         .treepm
         .then(|| ForceSplit::with(BOX, mesh_n, n, settings.softening_scale, settings.theta));
-    let mut sim = Simulation::new(cosmo, BOX, mesh_n, init.positions, init.momenta, a_start, split);
+    Simulation::new(cosmo, BOX, mesh_n, init.positions, init.momenta, a_start, split)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_simulation(frames: SyncSender<Frame>, settings: &RunSettings, control: &Control) {
+    let a_start = 1.0 / (1.0 + settings.z_start);
+    let a_end = 1.0 / (1.0 + settings.z_end);
+    let mut sim = init_simulation(settings);
 
     let steps = settings.steps;
     let started = Instant::now();

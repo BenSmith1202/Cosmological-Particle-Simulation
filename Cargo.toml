@@ -25,11 +25,19 @@ libm = "0.2"  # erfc for the TreePM short-range kernel
 serde = { version = "1", features = ["derive"] }  # saved settings
 serde_json = "1"
 half = "2.7"  # f32 -> f16 for the density volume texture (16-bit float is filterable; 32-bit often is not)
+web-time = "1"  # cross-platform Instant/Duration (works on desktop and wasm32)
 
 # Settings panel: immediate-mode UI drawn over the point view. 0.36 matches wgpu 30 and winit 0.30.
 egui = "0.36"
 egui-wgpu = "0.36"
 egui-winit = "0.36"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "Window", "Element", "HtmlCanvasElement"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 
 # Optimized in dev builds too: `cargo run` otherwise runs the numerics unoptimized, which is far slower.
 [profile.dev]

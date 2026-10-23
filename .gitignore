@@ -1,5 +1,6 @@
-# Rust / Cargo build artifacts
+# Rust / Cargo / Trunk build artifacts
 /target/
+/dist/
 **/*.rs.bk
 *.pdb
 
