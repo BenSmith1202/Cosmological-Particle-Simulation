@@ -1,0 +1,27 @@
+# Rust / Cargo build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Project runtime & simulation outputs
+/output/
+settings.json
+
+# OS-specific files (Windows / macOS)
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Editor / IDE directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Profiling, logs, and crash dumps
+*.log
+*.profraw
+*.profdata
+*.dmp

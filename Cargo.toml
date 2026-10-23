@@ -1,0 +1,40 @@
+[package]
+name = "cosmo_pm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+
+[dependencies]
+# Random initial conditions (Gaussian field)
+rand = "0.10"
+rand_distr = "0.6"
+
+# FFT for the Poisson solve
+rustfft = "6.4"
+num-complex = "0.4"
+
+# CPU parallelism for CIC deposit and particle updates
+rayon = "1.12"
+
+# Visualization window: GPU rendering, window + input
+wgpu = "30"
+winit = "0.30"
+pollster = "1"          # blocks on wgpu's async device setup
+bytemuck = { version = "1", features = ["derive"] }  # casting vertex data to bytes
+libm = "0.2"  # erfc for the TreePM short-range kernel
+serde = { version = "1", features = ["derive"] }  # saved settings
+serde_json = "1"
+half = "2.7"  # f32 -> f16 for the density volume texture (16-bit float is filterable; 32-bit often is not)
+
+# Settings panel: immediate-mode UI drawn over the point view. 0.36 matches wgpu 30 and winit 0.30.
+egui = "0.36"
+egui-wgpu = "0.36"
+egui-winit = "0.36"
+
+# Optimized in dev builds too: `cargo run` otherwise runs the numerics unoptimized, which is far slower.
+[profile.dev]
+opt-level = 3
+
+[dev-dependencies]
+# Parses and validates the WGSL shader in tests, with no GPU needed. Same naga version wgpu uses.
+naga = "30"
